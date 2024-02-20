@@ -67,10 +67,520 @@ Each layer interacts with the layers above and below it, enabling data flow from
 
    - The project follows the Client-Server model. In this model, the ESP8266 microcontroller acts as the client, responsible for collecting data from the sensors (DS18B20 temperature sensor and M274 rotary encoder) and sending it to the MySQL server. The MySQL server acts as the server, receiving the data from the client and storing it in the database. This client-server architecture enables the separation of concerns between data collection (client) and data storage/processing (server), allowing for scalability and flexibility in IoT applications.
 
+## Code 
+```cpp
+#include <Wire.h>
+#include <mcp2515.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+// WiFi settings
+const char *ssid = "Galaxy";
+const char *password = "12345678";
+
+// Server URL for logging data
+const char *serverURL = "http://192.168.245.231/ds18b20_testing/test_data.php";
+
+// WiFi client
+WiFiClient client;
+
+// CAN bus settings
+#define SENDER_CAN_ID 0x124
+const int spiCS = D8;
+MCP2515 mcp2515Sender(spiCS);
+
+// Rotary encoder pins
+#define CLK D0
+#define DT D1
+
+// Constants for RPM calculation
+const int CPR = 20;
+const float radius = 0.03;
+
+// Temperature sensor pins
+#define SENSOR_1_BUS D2
+#define SENSOR_2_BUS D3
+#define SENSOR_3_BUS D4
+
+// Variables for storing temperature and RPM values
+float temp1, temp2, temp3;
+float rpm = 0;
+
+// Rotary encoder variables
+int counter = 0;
+int currentStateCLK;
+int lastStateCLK;
+
+// Dallas temperature sensors
+OneWire sensor1Wire(SENSOR_1_BUS);
+OneWire sensor2Wire(SENSOR_2_BUS);
+OneWire sensor3Wire(SENSOR_3_BUS);
+DallasTemperature sensor1(&sensor1Wire);
+DallasTemperature sensor2(&sensor2Wire);
+DallasTemperature sensor3(&sensor3Wire);
+
+// Enumeration for state machine
+enum State {
+  WAIT_FOR_DATA,
+  PRINT_RPM_SPEED,
+  PRINT_TEMP_1,
+  PRINT_TEMP_2,
+  PRINT_TEMP_3
+};
+
+// Initial state
+State currentState = WAIT_FOR_DATA;
+
+// Last update times for RPM and temperature readings
+unsigned long lastMillisRPM = 0;
+unsigned long lastMillisTemp = 0;
+
+// Last temperature print time
+unsigned long lastTempPrintMillis = 0;
+
+// Function prototypes
+void connectWiFi();
+float readTemperature(DallasTemperature &sensor);
+void logDataToServer(float temp1, float temp2, float temp3, float rpm);
+
+void setup() {
+  Serial.begin(9600);
+
+  Serial.println("Initializing MCP2515 Sender...");
+  mcp2515Sender.reset();
+  if (mcp2515Sender.setBitrate(CAN_500KBPS, MCP_8MHZ) != MCP2515::ERROR_OK) {
+    Serial.println("Error setting bitrate!");
+    while (1);
+  }
+  mcp2515Sender.setNormalMode();
+  Serial.println("MCP2515 Sender Initialized Successfully!");
+
+  connectWiFi();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  currentStateCLK = digitalRead(CLK);
+
+  if (currentStateCLK != lastStateCLK) {
+    if (digitalRead(DT) != currentStateCLK) {
+      counter--;
+    } else {
+      counter++;
+    }
+  }
+
+  switch (currentState) {
+    case WAIT_FOR_DATA:
+      if (currentMillis - lastMillisRPM >= 1000) {
+        currentState = PRINT_RPM_SPEED;
+        lastMillisRPM = currentMillis;
+      } else if (currentMillis - lastMillisTemp >= 10000) {
+        currentState = PRINT_TEMP_1;
+        lastMillisTemp = currentMillis;
+      }
+      break;
+
+    case PRINT_RPM_SPEED:
+      rpm = abs(counter * 60.0 / CPR);
+      float speed = (2 * PI * radius * rpm) / 60.0;
+
+      // Construct CAN message
+      struct can_frame canMsg;
+      canMsg.can_id = SENDER_CAN_ID;
+      canMsg.can_dlc = 8;
+      memcpy(canMsg.data, &rpm, sizeof(rpm));
+      memcpy(canMsg.data + sizeof(rpm), &speed, sizeof(speed));
+
+      // Send CAN message
+      mcp2515Sender.sendMessage(&canMsg);
+
+      // Log data to server
+      logDataToServer(temp1, temp2, temp3, rpm);
+
+      counter = 0;
+      currentState = WAIT_FOR_DATA;
+      break;
+
+    case PRINT_TEMP_1:
+    case PRINT_TEMP_2:
+    case PRINT_TEMP_3:
+      if (currentMillis - lastTempPrintMillis >= 1000) {
+        // Read temperature from the corresponding sensor
+        float temp = readTemperature(currentState == PRINT_TEMP_1 ? sensor1 : (currentState == PRINT_TEMP_2 ? sensor2 : sensor3));
+
+        // Construct CAN message
+        struct can_frame canMsg;
+        canMsg.can_id = SENDER_CAN_ID;
+        canMsg.can_dlc = 4;
+        memcpy(canMsg.data, &temp, sizeof(temp));
+
+        // Send CAN message
+        mcp2515Sender.sendMessage(&canMsg);
+
+        // Log data to server
+        logDataToServer(temp1, temp2, temp3, rpm);
+
+        lastTempPrintMillis = currentMillis;
+
+        // Update temperature variables based on state
+        if (currentState == PRINT_TEMP_1) {
+          temp1 = temp;
+          currentState = PRINT_TEMP_2;
+        } else if (currentState == PRINT_TEMP_2) {
+          temp2 = temp;
+          currentState = PRINT_TEMP_3;
+        } else {
+          temp3 = temp;
+          currentState = WAIT_FOR_DATA;
+        }
+      }
+      break;
+  }
+
+  lastStateCLK = currentStateCLK;
+}
+
+// Function to read temperature from a DallasTemperature sensor
+float readTemperature(DallasTemperature &sensor) {
+  sensor.requestTemperatures();
+  float tempC = sensor.getTempCByIndex(0);
+
+  Serial.print("Temperature: ");
+  Serial.println(tempC);
+
+  return tempC;
+}
+
+// Function to log data to the server
+void logDataToServer(float temp1, float temp2, float temp3, float rpm) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(client, serverURL);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "temp1=" + String(temp1) + "&temp2=" + String(temp2) + "&temp3=" + String(temp3) + "&rpm=" + String(rpm);
+
+    int httpCode = http.POST(postData);
+
+    Serial.print("Server URL: ");
+    Serial.println(serverURL);
+    Serial.print("Data sent to server: ");
+    Serial.println(postData);
+    Serial.print("HTTP Code: ");
+    Serial.println(httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.print("Server Response: ");
+      Serial.println(payload);
+    } else {
+      Serial.println("Failed to send data to server.");
+      Serial.println(http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+  } else {
+    Serial.println("WiFi not connected. Unable to send data to server.");
+  }
+}
+
+// Function to connect to WiFi
+void connectWiFi() {
+  WiFi.disconnect();
+  delay(1000);
+
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi");
+
+  int attemptCounter = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attemptCounter < 30) {
+    delay(500);
+    Serial.print(".");
+    attemptCounter++;
+ 
+
+ }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFailed to connect to WiFi. Please check your credentials.");
+  } else {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
+```
+
+## Explaination of code 
+
+Sure, let's break down the code part by part:
+
+1. **Includes and Global Variables**:
+    - The code includes necessary libraries for CAN communication, Dallas Temperature sensor, WiFi, and HTTP client.
+    - It defines global variables including WiFi credentials, server URL, CAN bus settings, pin configurations for sensors and rotary encoder, temperature and RPM values, and state variables for the state machine.
+
+```cpp
+#include <Wire.h>
+#include <mcp2515.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+
+const char *ssid = "Galaxy";
+const char *password = "12345678";
+
+const char *serverURL = "http://192.168.245.231/ds18b20_testing/test_data.php";
+
+WiFiClient client;
+
+#define SENDER_CAN_ID 0x124
+const int spiCS = D8;
+MCP2515 mcp2515Sender(spiCS);
+
+#define CLK D0
+#define DT D1
+
+const int CPR = 20;
+const float radius = 0.03;
+
+#define SENSOR_1_BUS D2
+#define SENSOR_2_BUS D3
+#define SENSOR_3_BUS D4
+
+float temp1, temp2, temp3;
+float rpm = 0;
+
+int counter = 0;
+int currentStateCLK;
+int lastStateCLK;
+
+OneWire sensor1Wire(SENSOR_1_BUS);
+OneWire sensor2Wire(SENSOR_2_BUS);
+OneWire sensor3Wire(SENSOR_3_BUS);
+DallasTemperature sensor1(&sensor1Wire);
+DallasTemperature sensor2(&sensor2Wire);
+DallasTemperature sensor3(&sensor3Wire);
+
+enum State {
+  WAIT_FOR_DATA,
+  PRINT_RPM_SPEED,
+  PRINT_TEMP_1,
+  PRINT_TEMP_2,
+  PRINT_TEMP_3
+};
+
+State currentState = WAIT_FOR_DATA;
+
+unsigned long lastMillisRPM = 0;
+unsigned long lastMillisTemp = 0;
+unsigned long lastTempPrintMillis = 0;
+```
+
+2. **Setup Function**:
+    - Initializes serial communication for debugging.
+    - Initializes MCP2515 CAN controller.
+    - Connects to WiFi network.
+    - Initializes the state machine.
+
+```cpp
+void setup() {
+  Serial.begin(9600);
+
+  Serial.println("Initializing MCP2515 Sender...");
+  mcp2515Sender.reset();
+  if (mcp2515Sender.setBitrate(CAN_500KBPS, MCP_8MHZ) != MCP2515::ERROR_OK) {
+    Serial.println("Error setting bitrate!");
+    while (1);
+  }
+  mcp2515Sender.setNormalMode();
+  Serial.println("MCP2515 Sender Initialized Successfully!");
+
+  connectWiFi();
+}
+```
+
+3. **Loop Function**:
+    - Reads rotary encoder values and calculates RPM.
+    - Based on the state machine, either sends RPM and speed data or reads temperature data from sensors and sends it.
+    - Logs data to the server.
+
+```cpp
+void loop() {
+  unsigned long currentMillis = millis();
+  currentStateCLK = digitalRead(CLK);
+
+  // Rotary encoder reading
+  if (currentStateCLK != lastStateCLK) {
+    if (digitalRead(DT) != currentStateCLK) {
+      counter--;
+    } else {
+      counter++;
+    }
+  }
+
+  // State machine logic
+  switch (currentState) {
+    case WAIT_FOR_DATA:
+      if (currentMillis - lastMillisRPM >= 1000) {
+        currentState = PRINT_RPM_SPEED;
+        lastMillisRPM = currentMillis;
+      } else if (currentMillis - lastMillisTemp >= 10000) {
+        currentState = PRINT_TEMP_1;
+        lastMillisTemp = currentMillis;
+      }
+      break;
+
+    case PRINT_RPM_SPEED:
+      // RPM and speed calculation
+      rpm = abs(counter * 60.0 / CPR);
+      float speed = (2 * PI * radius * rpm) / 60.0;
+
+      // Construct CAN message
+      struct can_frame canMsg;
+      canMsg.can_id = SENDER_CAN_ID;
+      canMsg.can_dlc = 8;
+      memcpy(canMsg.data, &rpm, sizeof(rpm));
+      memcpy(canMsg.data + sizeof(rpm), &speed, sizeof(speed));
+
+      // Send CAN message
+      mcp2515Sender.sendMessage(&canMsg);
+
+      // Log data to server
+      logDataToServer(temp1, temp2, temp3, rpm);
+
+      counter = 0;
+      currentState = WAIT_FOR_DATA;
+      break;
+
+    case PRINT_TEMP_1:
+    case PRINT_TEMP_2:
+    case PRINT_TEMP_3:
+      if (currentMillis - lastTempPrintMillis >= 1000) {
+        // Read temperature from the corresponding sensor
+        float temp = readTemperature(currentState == PRINT_TEMP_1 ? sensor1 : (currentState == PRINT_TEMP_2 ? sensor2 : sensor3));
+
+        // Construct CAN message
+        struct can_frame canMsg;
+        canMsg.can_id = SENDER_CAN_ID;
+        canMsg.can_dlc = 4;
+        memcpy(canMsg.data, &temp, sizeof(temp));
+
+        // Send CAN message
+        mcp2515Sender.sendMessage(&canMsg);
+
+        // Log data to server
+        logDataToServer(temp1, temp2, temp3, rpm);
+
+        lastTempPrintMillis = currentMillis;
+
+        // Update temperature variables based on state
+        if (currentState == PRINT_TEMP_1) {
+          temp1 = temp;
+          currentState = PRINT_TEMP_2;
+        } else if (currentState == PRINT_TEMP_2) {
+          temp2 = temp;
+          currentState = PRINT_TEMP_3;
+        } else {
+          temp3 = temp;
+          currentState = WAIT_FOR_DATA;
+        }
+      }
+      break;
+  }
+
+  lastStateCLK = currentStateCLK;
+}
+```
+
+4. **Helper Functions**:
+    - `readTemperature`: Reads temperature from a DallasTemperature sensor.
+    - `logDataToServer`: Logs temperature and RPM data to the server.
+    - `connectWiFi`: Connects to WiFi network.
+
+```cpp
+float readTemperature(DallasTemperature &sensor) {
+  sensor.requestTemperatures();
+  float tempC = sensor.getTempCByIndex(0);
+
+  Serial.print("Temperature: ");
+  Serial.println(tempC);
+
+  return tempC;
+}
+
+void logDataToServer(float temp1, float temp2, float temp3, float rpm) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    http.begin(client, serverURL);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "temp1=" + String(temp1) + "&temp2=" + String(temp2) + "&temp3=" + String(temp3) + "&rpm=" + String(rpm);
+
+    int httpCode = http.POST(postData);
+
+    Serial.print("Server URL: ");
+    Serial.println(serverURL);
+    Serial.print("Data sent to server: ");
+    Serial.println(postData);
+    Serial.print("HTTP Code: ");
+    Serial.println(httpCode);
+
+    if (httpCode == HTTP_CODE_OK) {
+      String payload = http.getString();
+      Serial.print("Server Response: ");
+      Serial.println(payload);
+    } else {
+      Serial.println("Failed to send data to server.");
+      Serial.println(http.errorToString(httpCode).c_str());
+    }
+
+    http.end();
+  } else
+
+ {
+    Serial.println("WiFi not connected. Unable to send data to server.");
+  }
+}
+
+void connectWiFi() {
+  WiFi.disconnect();
+  delay(1000);
+
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi");
+
+  int attemptCounter = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attemptCounter < 30) {
+    delay(500);
+    Serial.print(".");
+    attemptCounter++;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFailed to connect to WiFi. Please check your credentials.");
+  } else {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+}
+```
+
+This code is designed to interface with a CAN bus, read RPM from a rotary encoder, read temperatures from Dallas Temperature sensors, and log data to a server over WiFi. It utilizes a state machine to manage different tasks efficiently and follows best practices for IoT device development.
+
 ## Output
 
 ![image](https://github.com/KetanMe/MySQL-Data-Logging-for-CAN-sender/assets/121623546/92b0a40d-5b04-4af7-9f3b-fc508512ff8f)
 
+See the .csv file [here](https://github.com/KetanMe/MySQL-Data-Logging-for-CAN-sender/blob/main/table_1.csv)
 
 
 
