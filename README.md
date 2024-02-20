@@ -13,7 +13,8 @@
    - [Helper Functions](#helper-functions)
 7. [PHP Script for MySQL](#php-script-for-mysql)
    - [Explanation of PHP Script](#explanation-of-php-script)
-8. [Output](#output)
+8. [Corresponding Reciver Code](#corresponding-reciver-code)
+9. [Output](#output)
 
 ## Introduction
 In this project I have used MySQL database to log the data of e-ATV parameters.This project will send the data on 
@@ -646,6 +647,127 @@ mysqli_close($conn);
 
 6. **Closing Database Connection**: Finally, the script closes the database connection using `mysqli_close()`.
 
+## Corresponding Reciver Code
+```cpp
+#include <Wire.h>
+#include <mcp2515.h>
+#include <U8g2lib.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define MAX_TEMP_VALUES 10
+
+const int spiCS = D8;
+
+MCP2515 mcp2515Receiver(spiCS);
+
+struct can_frame canMsg;
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+
+float lastReceivedRPM = 0.0;
+float tempValues[MAX_TEMP_VALUES];
+int tempCount = 0;
+
+void drawTemps() {
+  display.setFont(u8g2_font_profont12_mf);
+
+  // Set left-aligned position
+  int xPositionLeft = 2;
+  display.setCursor(xPositionLeft, 60);
+  display.print(tempValues[0], 1);
+  display.print(" ");
+
+  // Set center-aligned position
+  int xPositionCenter = (SCREEN_WIDTH - display.getUTF8Width(String(tempValues[1], 1).c_str())) / 2;
+  display.setCursor(xPositionCenter, 60);
+  display.print(tempValues[1], 1);
+  display.print(" ");
+
+  // Set right-aligned position
+  int xPositionRight = SCREEN_WIDTH - display.getUTF8Width(String(tempValues[2], 1).c_str()) - 2;
+  display.setCursor(xPositionRight, 60);
+  display.print(tempValues[2], 1);
+  display.print(" ");
+}
+
+void draw() {
+  display.setFont(u8g2_font_profont29_mf);
+  char rpmCharArray[10];
+  dtostrf(lastReceivedRPM, 1, 0, rpmCharArray);
+
+  int rpmTextWidth = display.getStrWidth(rpmCharArray);
+  int xPosition = (SCREEN_WIDTH - rpmTextWidth) / 2;
+  int yPosition = 30;
+
+  display.setCursor(xPosition, yPosition);
+  display.print(rpmCharArray);
+}
+
+void setup() {
+  Serial.begin(9600);
+  display.begin();
+
+  Serial.println("Initializing MCP2515 Receiver...");
+  mcp2515Receiver.reset();
+  if (mcp2515Receiver.setBitrate(CAN_500KBPS, MCP_8MHZ) != MCP2515::ERROR_OK) {
+    Serial.println("Error setting bitrate!");
+    while (1);
+  }
+  mcp2515Receiver.setNormalMode();
+  Serial.println("MCP2515 Receiver Initialized Successfully!");
+}
+
+void loop() {
+  if (mcp2515Receiver.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+    switch (canMsg.can_dlc) {
+      case 8:
+        // Received RPM and Speed
+        float receivedRPM, receivedSpeed;
+        memcpy(&receivedRPM, canMsg.data, sizeof(receivedRPM));
+        memcpy(&receivedSpeed, canMsg.data + sizeof(receivedRPM), sizeof(receivedSpeed));
+
+        Serial.print("Received RPM: ");
+        Serial.print(receivedRPM);
+        Serial.print(", Speed: ");
+        Serial.println(receivedSpeed);
+
+        lastReceivedRPM = receivedRPM;
+        break;
+
+      case 4:
+        // Received Temperature
+        float receivedTemp;
+        memcpy(&receivedTemp, canMsg.data, sizeof(receivedTemp));
+
+        if (tempCount < MAX_TEMP_VALUES) {
+          tempValues[tempCount] = receivedTemp;
+          tempCount++;
+        } else {
+          for (int i = 0; i < MAX_TEMP_VALUES - 1; ++i) {
+            tempValues[i] = tempValues[i + 1];
+          }
+          tempValues[MAX_TEMP_VALUES - 1] = receivedTemp;
+        }
+
+        Serial.print("Received Temperature: ");
+        Serial.println(receivedTemp);
+        break;
+
+      default:
+        Serial.println("Invalid data length!");
+        break;
+    }
+  }
+
+  // Display data on the OLED screen
+  display.clearBuffer();
+  draw();
+  drawTemps();
+  display.sendBuffer();
+  delay(500);
+}
+```
 ## Output
 
 ![image](https://github.com/KetanMe/MySQL-Data-Logging-for-CAN-sender/assets/121623546/92b0a40d-5b04-4af7-9f3b-fc508512ff8f)
