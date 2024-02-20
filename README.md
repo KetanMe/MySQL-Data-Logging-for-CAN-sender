@@ -1,5 +1,20 @@
 # MySQL-Data-Logging-for-CAN-sender
 
+## Table of Contents
+1. [Introduction](#introduction)
+2. [MySQL: Basic Overview](#mysql-basic-overview)
+3. [Block Diagram](#block-diagram)
+4. [IoT Layers Used in the Project](#iot-layers-used-in-the-project)
+5. [Protocols, Services, and Models](#protocols-services-and-models)
+6. [Code Explanation](#code-explanation)
+   - [Includes and Global Variables](#includes-and-global-variables)
+   - [Setup Function](#setup-function)
+   - [Loop Function](#loop-function)
+   - [Helper Functions](#helper-functions)
+7. [PHP Script for MySQL](#php-script-for-mysql)
+   - [Explanation of PHP Script](#explanation-of-php-script)
+8. [Output](#output)
+
 ## Introduction
 In this project I have used MySQL database to log the data of e-ATV parameters.This project will send the data on 
 
@@ -575,6 +590,61 @@ void connectWiFi() {
 ```
 
 This code is designed to interface with a CAN bus, read RPM from a rotary encoder, read temperatures from Dallas Temperature sensors, and log data to a server over WiFi. It utilizes a state machine to manage different tasks efficiently and follows best practices for IoT device development.
+
+## PHP script for MySQL
+
+```php
+<?php
+$hostname = "localhost";  // Replace with your actual MySQL server IP or hostname
+$username = "root";
+$password = "";
+$database = "testing";
+
+$conn = mysqli_connect($hostname, $username, $password, $database);
+
+if (!$conn) {
+    die("Connection fail" . mysqli_connect_error());
+}
+
+// Check if temp1, temp2, and temp3 are set in the POST request
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    if (isset($_POST["temp1"]) && isset($_POST["temp2"]) && isset($_POST["temp3"])) {
+        $t1 = $_POST["temp1"];
+        $t2 = $_POST["temp2"];
+        $t3 = $_POST["temp3"];
+
+        // Prepare and execute the SQL query
+        $sql = "INSERT INTO table_1 (temp1, temp2, temp3) VALUES (" . $t1 . ", " . $t2 . ", " . $t3 . ")";
+
+        if (mysqli_query($conn, $sql)) {
+            echo "\nNew record created";
+        } else {
+            echo "Error: " . $sql . "<br>" . mysqli_error($conn);
+        }
+    } else {
+        echo "Invalid data received. temp1, temp2, and temp3 are required.";
+    }
+} else {
+    echo "Invalid request method. Only POST requests are allowed.";
+}
+
+mysqli_close($conn);
+?>
+```
+
+## Explaination of PHP script
+
+1. **Database Connection**: The script starts by defining variables for the database connection parameters - `$hostname`, `$username`, `$password`, and `$database`. Then, it attempts to establish a connection to the MySQL database using the `mysqli_connect()` function. If the connection fails, it terminates the script and outputs an error message.
+
+2. **Handling POST Requests**: The script checks if the request method is POST using `$_SERVER["REQUEST_METHOD"]`. If it is a POST request, it proceeds to check if `temp1`, `temp2`, and `temp3` parameters are set in the POST data using `isset()`.
+
+3. **Inserting Data into the Database**: If all three parameters are set, their values are retrieved from the POST data (`$_POST`) and stored in variables `$t1`, `$t2`, and `$t3`. Then, an SQL query is constructed to insert these values into a table named `table_1` in the database. The query is executed using `mysqli_query()`. If the query is successful, it outputs a message indicating that a new record has been created. If there is an error executing the query, it outputs an error message along with the SQL query and the specific error returned by MySQL.
+
+4. **Error Handling for Invalid Data**: If `temp1`, `temp2`, or `temp3` parameters are missing in the POST data, it outputs a message indicating that invalid data was received and that these parameters are required.
+
+5. **Error Handling for Invalid Request Method**: If the request method is not POST, it outputs a message indicating that only POST requests are allowed.
+
+6. **Closing Database Connection**: Finally, the script closes the database connection using `mysqli_close()`.
 
 ## Output
 
